@@ -1,0 +1,3 @@
+# Normalize line endings in-repo to LF; checkout uses platform defaults.
+# Installed by install-lifecycle.ps1 to keep git CRLF warnings out of hook logs.
+* text=auto

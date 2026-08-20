@@ -74,8 +74,16 @@ if ($task.check_command) {
     $code = 0
     try {
         Push-Location $cwd
-        $out = Invoke-Expression $task.check_command 2>&1 | Out-String
-        $code = $LASTEXITCODE
+        # Native stderr must stay non-terminating here (PS 5.1 + 2>&1 + EAP Stop trap):
+        # a check command that merely WARNS but exits 0 must not block the session.
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = Invoke-Expression $task.check_command 2>&1 | Out-String
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $eap
+        }
     } catch {
         $out = $_.Exception.Message
         $code = 1

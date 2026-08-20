@@ -1,4 +1,5 @@
 ﻿{
     "ticket_prefix":  "tb",
-    "base_branch":  "main"
+    "base_branch":  "main",
+    "permission_mode":  "bypassPermissions"
 }

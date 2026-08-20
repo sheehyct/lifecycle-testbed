@@ -1,13 +1,33 @@
 # lifecycle-common.ps1 — shared helpers for the autonomous session lifecycle.
 # Dot-source from hooks/scripts. PowerShell 5.1 compatible. No secrets here (invariant 4).
 
+function Invoke-Native {
+    # Run a native command with stderr folded into Output WITHOUT tripping
+    # ErrorActionPreference=Stop — PS 5.1 turns redirected native stderr into
+    # terminating ErrorRecords otherwise (a git CRLF *warning* once killed the
+    # runner mid-flight). Returns @{ Output = [string[]]; ExitCode = [int] }.
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        return [pscustomobject]@{ Output = @($out); ExitCode = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $eap
+    }
+}
+
 function Get-PrimaryRoot {
     # Resolve the PRIMARY checkout root from any path inside a worktree or the primary
     # itself. Queue, claims, dispatches, locks, and the event log live in the primary;
     # worktrees only carry their own state/ and active-task.json.
     param([Parameter(Mandatory)][string]$Path)
-    $common = git -C $Path rev-parse --path-format=absolute --git-common-dir 2>$null
-    if (-not $common) { throw "Get-PrimaryRoot: '$Path' is not inside a git repository" }
+    $r = Invoke-Native -Exe 'git' -Arguments @('-C', $Path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    if ($r.ExitCode -ne 0 -or -not $r.Output) { throw "Get-PrimaryRoot: '$Path' is not inside a git repository" }
+    $common = [string]$r.Output[0]
     return (Split-Path ($common -replace '/', '\') -Parent)
 }
 
@@ -21,6 +41,9 @@ function Initialize-LifecycleDirs {
 
 function Write-LifecycleEvent {
     # Append-only audit line: ISO8601 | component | session | EVENT | detail
+    # Best-effort by design: concurrent runners contend for events.log (Add-Content
+    # holds an exclusive handle), so retry with jitter and NEVER throw — audit
+    # logging must never kill the component doing the real work.
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$Component,
@@ -28,9 +51,19 @@ function Write-LifecycleEvent {
         [Parameter(Mandatory)][string]$Event,
         [string]$Detail = ''
     )
-    Initialize-LifecycleDirs -Root $Root
-    $line = '{0} | {1} | {2} | {3} | {4}' -f (Get-Date -Format o), $Component, $SessionId, $Event, ($Detail -replace "`r?`n", ' / ')
-    Add-Content -Path (Join-Path $Root '.lifecycle\logs\events.log') -Value $line -Encoding utf8
+    try {
+        Initialize-LifecycleDirs -Root $Root
+        $line = '{0} | {1} | {2} | {3} | {4}' -f (Get-Date -Format o), $Component, $SessionId, $Event, ($Detail -replace "`r?`n", ' / ')
+        $path = Join-Path $Root '.lifecycle\logs\events.log'
+        for ($i = 0; $i -lt 5; $i++) {
+            try {
+                Add-Content -Path $path -Value $line -Encoding utf8 -ErrorAction Stop
+                return
+            } catch {
+                Start-Sleep -Milliseconds (20 + (Get-Random -Maximum 80))
+            }
+        }
+    } catch {}
 }
 
 function Read-DotEnvValue {
@@ -57,10 +90,33 @@ function New-AtomicClaim {
     }
 }
 
+function Resolve-CodexExe {
+    # Start-Process needs a real Win32 executable, but the npm-installed 'codex'
+    # command is a script shim (.cmd/.ps1). Prefer a codex.exe on PATH, else find
+    # the native binary inside the shim's npm package.
+    $onPath = Get-Command codex -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -match '\.exe$' }
+    if ($onPath) { return @($onPath)[0].Source }
+    $shim = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($shim) {
+        $pkgDir = Join-Path (Split-Path $shim.Source -Parent) 'node_modules\@openai\codex'
+        if (Test-Path $pkgDir) {
+            $exe = Get-ChildItem $pkgDir -Recurse -Filter 'codex.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+        }
+    }
+    throw 'codex.exe not found; is the Codex CLI installed?'
+}
+
 function Get-LifecycleConfig {
     # Tracked per-repo config (ticket_prefix, base_branch) written by the installer.
     param([Parameter(Mandatory)][string]$Root)
     $cfgPath = Join-Path $Root 'lifecycle.config.json'
-    if (Test-Path $cfgPath) { return (Get-Content $cfgPath -Raw | ConvertFrom-Json) }
-    return [pscustomobject]@{ ticket_prefix = 'task'; base_branch = 'main' }
+    if (Test-Path $cfgPath) {
+        $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+        if (-not ($cfg.PSObject.Properties.Name -contains 'permission_mode')) {
+            $cfg | Add-Member -NotePropertyName 'permission_mode' -NotePropertyValue 'acceptEdits'
+        }
+        return $cfg
+    }
+    return [pscustomobject]@{ ticket_prefix = 'task'; base_branch = 'main'; permission_mode = 'acceptEdits' }
 }

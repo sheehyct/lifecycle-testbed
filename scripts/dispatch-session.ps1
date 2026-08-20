@@ -84,9 +84,9 @@ if (-not (Test-Path $wtParent)) { New-Item -ItemType Directory -Force -Path $wtP
 $wt = Join-Path $wtParent $taskId
 $branchName = "task/$taskId"
 
-git -C $prim worktree add -b $branchName $wt $base 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'WORKTREE_FAILED' -Detail "$wt (branch $branchName)"
+$r = Invoke-Native -Exe 'git' -Arguments @('-C', $prim, 'worktree', 'add', '-b', $branchName, $wt, $base)
+if ($r.ExitCode -ne 0) {
+    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'WORKTREE_FAILED' -Detail "$wt (branch $branchName): $($r.Output -join ' / ')"
     Write-Error "git worktree add failed for $wt (does branch '$branchName' or the path already exist?)"
     exit 1
 }
@@ -111,11 +111,13 @@ New-Item -ItemType Directory -Force -Path (Join-Path $wt '.lifecycle\state') | O
     dispatched_at = (Get-Date -Format o)
 } | ConvertTo-Json | Set-Content -Path (Join-Path $prim ('.lifecycle\dispatches\{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $taskId)) -Encoding utf8
 
-# ---- Prompt -------------------------------------------------------------------------
+# ---- Prompt (no double-quote characters: PS 5.1 native-arg quoting mangles them) -----
+# NEVER lead with a slash command: in -p mode an unknown /command aborts the session
+# instantly (Unknown command: /session-start) instead of being read as prompt text.
 $prompt = @"
-/session-start
 You are running AUTONOMOUSLY (spawn depth $newDepth), dispatched by the session lifecycle.
-Adapt session-start's "wait for user direction" step: the TASK below IS your direction; proceed.
+If this repo has a session-start skill or command, follow its steps first — but adapt its
+wait-for-user-direction step: the TASK below IS your direction; proceed without waiting.
 
 TASK: $title
 
@@ -129,15 +131,31 @@ Rules:
   criteria are met, or 'BLOCKED: <what is missing>' if you cannot proceed.
 "@
 
-# ---- Launch (native --bg dispatch, from inside the worktree) -------------------------
-$env:LIFECYCLE_SPAWN_DEPTH = "$newDepth"
-Push-Location $wt
-try {
-    $launchOut = & claude --bg $prompt 2>&1 | Out-String
-} finally {
-    Pop-Location
+# ---- Launch (detached claude -p) -------------------------------------------------------
+# NOT --bg: a --bg session in a fresh worktree blocks forever on the workspace-trust
+# dialog (found in E2E verification: prompt delivered, 0 tokens processed). Per
+# `claude --help`, the trust dialog is SKIPPED in non-interactive mode (-p with
+# stdout redirected => not a TTY). -p fires SessionStart/Stop/SessionEnd hooks
+# normally and exits when the session completes, which triggers the SessionEnd
+# hook -> detached runner. Prompt goes via stdin (argument quoting mangles it).
+#
+# permission_mode from lifecycle.config.json: an unattended session cannot answer
+# permission prompts. acceptEdits default; bypassPermissions only where the repo
+# is disposable AND the structural gates (ruleset, read-only codex, depth guard,
+# worktree isolation) are in place.
+$promptFile = Join-Path $wt '.lifecycle\dispatch-prompt.txt'
+Set-Content -Path $promptFile -Value $prompt -Encoding utf8
+$sessionLog = Join-Path $wt '.lifecycle\session-output.log'
+
+$permArgs = "--permission-mode $($cfg.permission_mode)"
+if ($cfg.permission_mode -eq 'bypassPermissions') {
+    $permArgs = '--dangerously-skip-permissions'
 }
 
-Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCHED' -Detail "task=$taskId wt=$wt branch=$branchName depth=$newDepth"
-Write-Output "Dispatched '$taskId' (depth $newDepth) in $wt on $branchName"
-Write-Output $launchOut.Trim()
+$inner = "`$env:LIFECYCLE_SPAWN_DEPTH='$newDepth'; Set-Location '$wt'; Get-Content -Raw '$promptFile' | claude -p $permArgs *> '$sessionLog'"
+Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner
+)
+
+Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCHED' -Detail "task=$taskId wt=$wt branch=$branchName depth=$newDepth mode=$($cfg.permission_mode)"
+Write-Output "Dispatched '$taskId' (depth $newDepth) in $wt on $branchName (detached claude -p; session output: $sessionLog)"

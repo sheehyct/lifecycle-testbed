@@ -82,18 +82,20 @@ try {
         } else {
             $lockPath = $lockCandidate
 
-            # Findings file number: next N over existing audits (worktree checkout).
+            # Findings file: next N over existing audits, but ALWAYS suffixed with the
+            # session id — two runners on different branches can compute the same N
+            # concurrently, and same-named files on sibling branches are an add/add
+            # merge conflict. sid8 makes the name unique by construction.
             $reviewDir = Join-Path $wt 'docs\reviews'
             if (-not (Test-Path $reviewDir)) { New-Item -ItemType Directory -Force -Path $reviewDir | Out-Null }
             $n = 1
             Get-ChildItem $reviewDir -Filter "$prefix*-codex-audit.md" -ErrorAction SilentlyContinue | ForEach-Object {
-                if ($_.Name -match ('^' + [regex]::Escape($prefix) + '(\d+)-codex-audit\.md$')) {
+                if ($_.Name -match ('^' + [regex]::Escape($prefix) + '(\d+)(?:-[A-Za-z0-9]+)?-codex-audit\.md$')) {
                     $v = [int]$Matches[1]
                     if ($v -ge $n) { $n = $v + 1 }
                 }
             }
-            $findingsName = "$prefix$n-codex-audit.md"
-            if (Test-Path (Join-Path $reviewDir $findingsName)) { $findingsName = "$prefix$n-$sid8-codex-audit.md" }
+            $findingsName = "$prefix$n-$sid8-codex-audit.md"
             $findingsPath = Join-Path $reviewDir $findingsName
 
             $title = 'untitled'
@@ -101,8 +103,14 @@ try {
             $acceptance = '(none declared)'
             if ($task -and $task.acceptance) { $acceptance = $task.acceptance }
 
+            $diffScope = "Run 'git diff $base...HEAD' and 'git log $base..HEAD --oneline' to see the changes under review."
+            if ($branch -eq $base -or $ahead -eq 0) { $diffScope = "Run 'git status' and 'git diff' to see the uncommitted changes under review." }
             $reviewPrompt = @"
-Adversarial review of branch '$branch' (base '$base') for task: $title.
+You are performing an ADVERSARIAL code review of an autonomous coding session's work.
+Repository root: the current working directory. Branch '$branch', base '$base'.
+$diffScope Read any file you need for context.
+
+Task the session was given: $title
 Acceptance criteria the session claimed to meet:
 $acceptance
 
@@ -121,34 +129,54 @@ End your review with a line 'VERDICT: APPROVE' or 'VERDICT: APPROVE-WITH-NITS' o
             $errFile = Join-Path $prim ".lifecycle\tmp\$sid-codex-stderr.txt"
             $outFile = Join-Path $prim ".lifecycle\tmp\$sid-codex-stdout.txt"
 
-            # NEVER pass a sandbox-escalation flag (invariant 3): review's default
-            # sandbox is read-only; -o makes the Codex CLI (not the model) emit the
-            # final message to a file we then wrap.
-            $codexArgs = @('exec', 'review', $reviewPrompt, '--ephemeral', '-o', $raw)
-            if ($branch -and $branch -ne $base) { $codexArgs += @('--base', $base) } else { $codexArgs += '--uncommitted' }
+            # `codex exec review` rejects a custom prompt combined with --base, and the
+            # acceptance-criteria context IS the review's value — so use `codex exec`
+            # with an EXPLICIT read-only sandbox (invariant 3; DEVIATIONS.md C.2 entry)
+            # and a prompt that diffs the range itself. -o makes the Codex CLI (not the
+            # model) emit the final message to a file we then wrap. The prompt goes via
+            # STDIN ('-'): argument-string quoting mangles multi-line prompts.
+            $codexArgs = @('exec', '-', '-s', 'read-only', '--ephemeral', '--skip-git-repo-check', '-o', $raw)
 
-            Log 'codex: exec review (args logged sans prompt)'
+            $codexExe = Resolve-CodexExe   # npm 'codex' is a script shim; we need the real .exe
+            Log "codex: $codexExe $($codexArgs -join ' ') (prompt via stdin)"
             LogEvent 'CODEX_START' "branch=$branch base=$base out=$findingsName"
-            $proc = Start-Process -FilePath 'codex' -ArgumentList $codexArgs -WorkingDirectory $wt `
-                -WindowStyle Hidden -PassThru -RedirectStandardError $errFile -RedirectStandardOutput $outFile
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $codexExe
+            $psi.Arguments = (($codexArgs | ForEach-Object {
+                if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+            }) -join ' ')
+            $psi.WorkingDirectory = $wt
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $proc.StandardInput.Write($reviewPrompt)
+            $proc.StandardInput.Close()
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()   # async: avoids full-buffer deadlock
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
             $finished = $proc.WaitForExit(1200000)   # 20 minutes
             if (-not $finished) {
-                & taskkill /PID $proc.Id /T /F 2>$null | Out-Null
+                Invoke-Native -Exe 'taskkill' -Arguments @('/PID', "$($proc.Id)", '/T', '/F') | Out-Null
                 $verdict = 'REVIEW-FAILED'
                 Log 'codex timed out after 20 minutes; process tree killed'
                 LogEvent 'CODEX_TIMEOUT'
-            } elseif ($proc.ExitCode -ne 0) {
-                $verdict = 'REVIEW-FAILED'
-                $stderrTail = ''
-                if (Test-Path $errFile) { $stderrTail = ((Get-Content $errFile | Select-Object -Last 10) -join ' / ') }
-                Log "codex exit $($proc.ExitCode): $stderrTail"
-                LogEvent 'CODEX_FAILED' "exit=$($proc.ExitCode)"
             } else {
-                LogEvent 'CODEX_DONE'
+                Set-Content -Path $outFile -Value $stdoutTask.Result -Encoding utf8
+                Set-Content -Path $errFile -Value $stderrTask.Result -Encoding utf8
+                if ($proc.ExitCode -ne 0) {
+                    $verdict = 'REVIEW-FAILED'
+                    $stderrTail = (($stderrTask.Result -split "`n") | Select-Object -Last 10) -join ' / '
+                    Log "codex exit $($proc.ExitCode): $stderrTail"
+                    LogEvent 'CODEX_FAILED' "exit=$($proc.ExitCode)"
+                } else {
+                    LogEvent 'CODEX_DONE'
+                }
             }
 
             $rawContent = '(codex produced no output)'
-            if (Test-Path $raw) { $rawContent = Get-Content $raw -Raw }
+            if (Test-Path $raw) { $rawContent = Get-Content $raw -Raw -Encoding utf8 }
             if ($verdict -ne 'REVIEW-FAILED') {
                 if ($rawContent -match 'VERDICT:\s*(APPROVE-WITH-NITS|APPROVE|NEEDS-CHANGES|BLOCK)') {
                     $verdict = $Matches[1]
@@ -175,7 +203,7 @@ End your review with a line 'VERDICT: APPROVE' or 'VERDICT: APPROVE-WITH-NITS' o
 
 - **Session:** $sid (task: $title)
 - **Reviewed:** $reviewedRange
-- **Reviewer:** codex exec review (read-only sandbox, --ephemeral), wrapped by session-end-runner.ps1
+- **Reviewer:** codex exec (-s read-only, --ephemeral), wrapped by session-end-runner.ps1
 - **Runner verdict parse:** $verdict
 - **Session outcome claim:** $outcome
 
@@ -200,12 +228,17 @@ $rawContent
 
             # Commit the findings on the session branch; push the BRANCH only. The
             # base branch is protected server-side (invariant 1) and we never try it.
-            git -C $wt add -- docs/reviews 2>&1 | ForEach-Object { Log "git add: $_" }
-            git -C $wt commit -m "chore(review): codex audit $findingsName (session $sid8)" 2>&1 | ForEach-Object { Log "git commit: $_" }
-            $originUrl = (git -C $wt remote get-url origin 2>$null | Out-String).Trim()
+            $r = Invoke-Native -Exe 'git' -Arguments @('-C', $wt, 'add', '--', 'docs/reviews')
+            $r.Output | ForEach-Object { Log "git add: $_" }
+            $r = Invoke-Native -Exe 'git' -Arguments @('-C', $wt, 'commit', '-m', "chore(review): codex audit $findingsName (session $sid8)")
+            $r.Output | ForEach-Object { Log "git commit: $_" }
+            $r = Invoke-Native -Exe 'git' -Arguments @('-C', $wt, 'remote', 'get-url', 'origin')
+            $originUrl = ''
+            if ($r.ExitCode -eq 0 -and $r.Output) { $originUrl = ([string]$r.Output[0]).Trim() }
             if ($originUrl -and $branch -and $branch -ne $base) {
-                git -C $wt push -u origin $branch 2>&1 | ForEach-Object { Log "git push: $_" }
-                if ($LASTEXITCODE -ne 0) { LogEvent 'PUSH_FAILED' $branch } else { LogEvent 'PUSHED' $branch }
+                $r = Invoke-Native -Exe 'git' -Arguments @('-C', $wt, 'push', '-u', 'origin', $branch)
+                $r.Output | ForEach-Object { Log "git push: $_" }
+                if ($r.ExitCode -ne 0) { LogEvent 'PUSH_FAILED' $branch } else { LogEvent 'PUSHED' $branch }
             } elseif ($originUrl) {
                 Log "on base branch '$base'; not pushing (base is protected; findings stay local)"
             } else {
@@ -219,7 +252,9 @@ $rawContent
     # ---- 3. Notify (best-effort; topic from .env ONLY -- invariant 4) -------------
     $ntfy = Read-DotEnvValue -Root $prim -Key 'NTFY_TOPIC_URL'
     $repoWeb = ''
-    $originUrl2 = (git -C $wt remote get-url origin 2>$null | Out-String).Trim()
+    $originUrl2 = ''
+    $r = Invoke-Native -Exe 'git' -Arguments @('-C', $wt, 'remote', 'get-url', 'origin')
+    if ($r.ExitCode -eq 0 -and $r.Output) { $originUrl2 = ([string]$r.Output[0]).Trim() }
     if ($originUrl2 -match 'github\.com[:/]([^/]+)/([^/\s]+?)(\.git)?$') {
         $repoWeb = 'https://github.com/{0}/{1}' -f $Matches[1], $Matches[2]
     }
