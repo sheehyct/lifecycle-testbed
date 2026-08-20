@@ -1,0 +1,4 @@
+﻿
+# lifecycle runtime + secrets (added by install-lifecycle.ps1)
+.lifecycle/
+.env

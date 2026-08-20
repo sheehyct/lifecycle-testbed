@@ -1,0 +1,31 @@
+﻿{
+    "hooks":  {
+                  "Stop":  [
+                               {
+                                   "hooks":  [
+                                                 {
+                                                     "type":  "command",
+                                                     "command":  "\u0026 \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\stop-gate.ps1\"",
+                                                     "shell":  "powershell",
+                                                     "timeout":  300,
+                                                     "statusMessage":  "Completion gate: checking task acceptance"
+                                                 }
+                                             ]
+                               }
+                           ],
+                  "SessionEnd":  [
+                                     {
+                                         "matcher":  "other|prompt_input_exit|logout",
+                                         "hooks":  [
+                                                       {
+                                                           "type":  "command",
+                                                           "command":  "\u0026 \"$env:CLAUDE_PROJECT_DIR\\.claude\\hooks\\session-end.ps1\"",
+                                                           "shell":  "powershell",
+                                                           "timeout":  30,
+                                                           "statusMessage":  "Handing off to detached session-end runner"
+                                                       }
+                                                   ]
+                                     }
+                                 ]
+              }
+}
