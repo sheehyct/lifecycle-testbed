@@ -59,7 +59,28 @@ foreach ($w in $wtList) {
     }
 }
 
-# 4. Gate counters left behind (session died mid-gate)
+# 4. Dispatched but no session-end ever seen (session killed mid-run, or still in flight)
+if (Test-Path $dispatchDir) {
+    $jobCwds = @()
+    foreach ($dir in @((Join-Path $prim '.lifecycle\jobs'), (Join-Path $prim '.lifecycle\jobs\done'))) {
+        if (Test-Path $dir) {
+            $jobCwds += Get-ChildItem $dir -Filter '*.json' -File | ForEach-Object {
+                ((Get-Content $_.FullName -Raw | ConvertFrom-Json).cwd -replace '/', '\')
+            }
+        }
+    }
+    foreach ($d in (Get-ChildItem $dispatchDir -Filter '*.json')) {
+        $rec = Get-Content $d.FullName -Raw | ConvertFrom-Json
+        $recWt = $rec.worktree -replace '/', '\'
+        if ($jobCwds -notcontains $recWt) {
+            $ageMin = [int]((Get-Date) - [datetime]$rec.dispatched_at).TotalMinutes
+            $issues++
+            Write-Output "[NO SESSION-END] $($rec.task_id) dispatched $ageMin min ago, no SessionEnd job for $recWt -- still in flight, or the session died (check $recWt\.lifecycle\session-output.log)"
+        }
+    }
+}
+
+# 5. Gate counters left behind (session died mid-gate)
 $stateDir = Join-Path $prim '.lifecycle\state'
 if (Test-Path $stateDir) {
     foreach ($s in (Get-ChildItem $stateDir -Filter 'stop-*.count' -ErrorAction SilentlyContinue)) {

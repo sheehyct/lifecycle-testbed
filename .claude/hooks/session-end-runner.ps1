@@ -291,7 +291,7 @@ $rawContent
     if ($depth -ge 1) {
         Log "SPAWN SUPPRESSED: depth=$depth (invariant 2: spawn depth <= 1)"
         LogEvent 'SPAWN_SUPPRESSED' "depth=$depth"
-    } elseif (@('BLOCK', 'REVIEW-FAILED') -contains $verdict -or $outcome -match 'BLOCKED|GATE-CAP') {
+    } elseif (@('BLOCK', 'NEEDS-CHANGES', 'REVIEW-FAILED') -contains $verdict -or $outcome -match 'BLOCKED|GATE-CAP') {
         Log "next-task dispatch suppressed: verdict=$verdict outcome=$outcome"
         LogEvent 'DISPATCH_SUPPRESSED' "verdict=$verdict"
     } else {
