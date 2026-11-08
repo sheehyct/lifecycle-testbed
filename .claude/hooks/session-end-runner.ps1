@@ -63,6 +63,7 @@ try {
 
     # ---- 2. Codex review (skip when there is nothing to review) ------------------
     $verdict = 'SKIPPED'
+    $verdictNote = ''
     $findingsRel = '-'
     if ($ahead -gt 0 -or $dirty) {
         # Per-branch lock: two sessions ending near-simultaneously on the SAME branch
@@ -183,6 +184,14 @@ End your review with a line 'VERDICT: APPROVE' or 'VERDICT: APPROVE-WITH-NITS' o
                 } else {
                     $verdict = 'UNSPECIFIED'
                 }
+                # LOW-only NEEDS-CHANGES is nits, not a halt (spec C.4, ASL-3).
+                if ($verdict -eq 'NEEDS-CHANGES' -and
+                    $rawContent -notmatch '\[(CRITICAL|HIGH|MEDIUM)\]' -and
+                    $rawContent -match '\[LOW\]') {
+                    $verdict = 'APPROVE-WITH-NITS'
+                    $verdictNote = ' (downgraded: reviewer said NEEDS-CHANGES, all findings LOW)'
+                    Log "verdict downgraded NEEDS-CHANGES -> APPROVE-WITH-NITS (LOW-only findings)"
+                }
             }
 
             # The RUNNER composes the findings file (invariant 3): template wrapper
@@ -204,7 +213,7 @@ End your review with a line 'VERDICT: APPROVE' or 'VERDICT: APPROVE-WITH-NITS' o
 - **Session:** $sid (task: $title)
 - **Reviewed:** $reviewedRange
 - **Reviewer:** codex exec (-s read-only, --ephemeral), wrapped by session-end-runner.ps1
-- **Runner verdict parse:** $verdict
+- **Runner verdict parse:** $verdict$verdictNote
 - **Session outcome claim:** $outcome
 
 ## 2. Verbatim audit
@@ -249,7 +258,40 @@ $rawContent
         Log 'nothing to review (0 commits ahead, clean tree)'
     }
 
-    # ---- 3. Notify (best-effort; topic from .env ONLY -- invariant 4) -------------
+    # ---- 3. Spawn decision (invariant 2: chain <= max_chain, fix rounds <= max_fix_rounds)
+    # Fail-safe: every counter is the MAX of all its signals (job env capture + marker).
+    $maxChain = [int]$cfg.max_chain
+    $maxFix   = [int]$cfg.max_fix_rounds
+    $chain = [int]$job.chain_env
+    if ($chain -lt 0) { $chain = [int]$job.spawn_depth_env }   # pre-ASL-3 job or interactive (0)
+    $fix = [int]$job.fix_round_env
+    if ($task) {
+        if ($null -ne $task.chain)     { $chain = [Math]::Max([int]$task.chain, $chain) }
+        elseif ($null -ne $task.depth) { $chain = [Math]::Max([int]$task.depth, $chain) }   # legacy marker
+        if ($null -ne $task.fix_round) { $fix = [Math]::Max([int]$task.fix_round, $fix) }
+    }
+    $halted = ($outcome -match 'BLOCKED|GATE-CAP')
+    $action = 'none'; $actionNote = 'queue: nothing to do'
+    if ($verdict -eq 'NEEDS-CHANGES' -and $task -and -not $halted) {
+        if ($fix -lt $maxFix) {
+            $action = 'fix'; $actionNote = "next: fix round $($fix + 1)/$maxFix on this branch"
+        } else {
+            $actionNote = "HALTED: fix rounds exhausted ($fix/$maxFix) - needs you"
+            LogEvent 'FIX_ROUNDS_EXHAUSTED' "fix_round=$fix max=$maxFix"
+        }
+    } elseif (@('BLOCK', 'NEEDS-CHANGES', 'REVIEW-FAILED', 'UNSPECIFIED') -contains $verdict -or $halted) {
+        $actionNote = "HALTED: verdict=$verdict - needs you"
+        Log "next-task dispatch suppressed: verdict=$verdict outcome=$outcome"
+        LogEvent 'DISPATCH_SUPPRESSED' "verdict=$verdict"
+    } elseif ($chain + 1 -ge $maxChain) {
+        $actionNote = "chain cap reached ($($chain + 1)/$maxChain) - queue paused"
+        Log "SPAWN SUPPRESSED: chain=$chain next would reach max_chain=$maxChain (invariant 2)"
+        LogEvent 'SPAWN_SUPPRESSED' "chain=$chain max_chain=$maxChain"
+    } else {
+        $action = 'next'; $actionNote = 'next: queued task (if any)'
+    }
+
+    # ---- 4. Notify (best-effort; topic from .env ONLY -- invariant 4) -------------
     $ntfy = Read-DotEnvValue -Root $prim -Key 'NTFY_TOPIC_URL'
     $repoWeb = ''
     $originUrl2 = ''
@@ -266,7 +308,8 @@ $rawContent
     $body = @(
         "outcome: $outcome",
         "review: $verdict ($findingsRel)",
-        "diff: $diffstat"
+        "diff: $diffstat",
+        $actionNote
     ) -join "`n"
     if ($ntfy) {
         try {
@@ -283,18 +326,20 @@ $rawContent
         LogEvent 'NTFY_SKIPPED'
     }
 
-    # ---- 4. Spawn guard + next-task dispatch (invariant 2: depth <= 1) ------------
-    # Fail-safe: take the MAX of every depth signal; any signal >= 1 suppresses.
-    $depth = [int]$job.spawn_depth_env
-    if ($task -and ($null -ne $task.depth)) { $depth = [Math]::Max([int]$task.depth, $depth) }
-
-    if ($depth -ge 1) {
-        Log "SPAWN SUPPRESSED: depth=$depth (invariant 2: spawn depth <= 1)"
-        LogEvent 'SPAWN_SUPPRESSED' "depth=$depth"
-    } elseif (@('BLOCK', 'NEEDS-CHANGES', 'REVIEW-FAILED') -contains $verdict -or $outcome -match 'BLOCKED|GATE-CAP') {
-        Log "next-task dispatch suppressed: verdict=$verdict outcome=$outcome"
-        LogEvent 'DISPATCH_SUPPRESSED' "verdict=$verdict"
-    } else {
+    # ---- 5. Execute the spawn decision ------------------------------------------
+    if ($action -eq 'fix') {
+        $taskFile = [string]$task.task_file
+        if ($taskFile -and -not [IO.Path]::IsPathRooted($taskFile)) { $taskFile = Join-Path $prim $taskFile }
+        Log "dispatching fix round $($fix + 1) for $($task.task_id) (audit $findingsRel)"
+        LogEvent 'DISPATCH_FIX' "task=$($task.task_id) fix_round=$($fix + 1) audit=$findingsRel"
+        try {
+            & (Join-Path $prim 'scripts\dispatch-session.ps1') -TaskFile $taskFile -Chain $chain -FixRound ($fix + 1) -FixFindings $findingsRel -SkipClaim 2>&1 |
+                ForEach-Object { Log "dispatch: $_" }
+        } catch {
+            Log "fix dispatch failed: $($_.Exception.Message)"
+            LogEvent 'DISPATCH_FAILED' $_.Exception.Message
+        }
+    } elseif ($action -eq 'next') {
         $next = $null
         $queueDir = Join-Path $prim 'queue'
         if (Test-Path $queueDir) {
@@ -306,10 +351,10 @@ $rawContent
             }
         }
         if ($next) {
-            Log "dispatching next task: $($next.Name)"
-            LogEvent 'DISPATCH_NEXT' $next.Name
+            Log "dispatching next task: $($next.Name) at chain $($chain + 1)"
+            LogEvent 'DISPATCH_NEXT' "$($next.Name) chain=$($chain + 1)"
             try {
-                & (Join-Path $prim 'scripts\dispatch-session.ps1') -TaskFile $next.FullName -Depth 1 -SkipClaim 2>&1 |
+                & (Join-Path $prim 'scripts\dispatch-session.ps1') -TaskFile $next.FullName -Chain ($chain + 1) -SkipClaim 2>&1 |
                     ForEach-Object { Log "dispatch: $_" }
             } catch {
                 Remove-Item (Join-Path $prim ".lifecycle\claims\$($next.BaseName)") -Force -ErrorAction SilentlyContinue

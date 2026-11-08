@@ -113,10 +113,13 @@ function Get-LifecycleConfig {
     $cfgPath = Join-Path $Root 'lifecycle.config.json'
     if (Test-Path $cfgPath) {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-        if (-not ($cfg.PSObject.Properties.Name -contains 'permission_mode')) {
-            $cfg | Add-Member -NotePropertyName 'permission_mode' -NotePropertyValue 'acceptEdits'
+        $defaults = @{ permission_mode = 'acceptEdits'; max_chain = 5; max_fix_rounds = 2 }
+        foreach ($k in $defaults.Keys) {
+            if (-not ($cfg.PSObject.Properties.Name -contains $k)) {
+                $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $defaults[$k]
+            }
         }
         return $cfg
     }
-    return [pscustomobject]@{ ticket_prefix = 'task'; base_branch = 'main'; permission_mode = 'acceptEdits' }
+    return [pscustomobject]@{ ticket_prefix = 'task'; base_branch = 'main'; permission_mode = 'acceptEdits'; max_chain = 5; max_fix_rounds = 2 }
 }

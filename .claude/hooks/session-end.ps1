@@ -28,6 +28,10 @@ try {
 
     $depthEnv = 0
     if ($env:LIFECYCLE_SPAWN_DEPTH) { $depthEnv = [int]$env:LIFECYCLE_SPAWN_DEPTH }
+    $chainEnv = -1   # -1 = not an automated session (no env marker)
+    if ($env:LIFECYCLE_CHAIN) { $chainEnv = [int]$env:LIFECYCLE_CHAIN }
+    $fixEnv = 0
+    if ($env:LIFECYCLE_FIX_ROUND) { $fixEnv = [int]$env:LIFECYCLE_FIX_ROUND }
 
     $job = [pscustomobject]@{
         session_id      = $sid
@@ -36,6 +40,8 @@ try {
         reason          = $payload.reason
         ended_at        = (Get-Date -Format o)
         spawn_depth_env = $depthEnv    # captured NOW; the detached runner gets a copy of this env
+        chain_env       = $chainEnv
+        fix_round_env   = $fixEnv
     }
     $jobPath = Join-Path $jobRoot ".lifecycle\jobs\$sid.json"
     $job | ConvertTo-Json | Set-Content -Path $jobPath -Encoding utf8

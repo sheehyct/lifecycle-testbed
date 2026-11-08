@@ -1,16 +1,23 @@
 # Dispatch a queued task as an autonomous session (spec Component A).
-# Creates the worktree FIRST so the machine-checkable depth marker
+# Creates the worktree FIRST so the machine-checkable spawn marker
 # (.lifecycle/active-task.json) exists before the session starts (invariant 2;
-# DEVIATIONS.md Component A entry), then launches `claude --bg` from inside it.
+# DEVIATIONS.md Component A entry), then launches a detached `claude -p` inside it.
 #
-# Depth semantics: a human-dispatched session is depth 0; its SessionEnd runner may
-# dispatch ONE follow-up at depth 1; a depth-1 session's runner is refused here and
-# in the runner itself. Two independent layers, both machine-checkable.
+# Spawn semantics (invariant 2, reopened ASL-3): two counted axes, each hard-capped.
+#   chain     - position in a run of queued tasks. A human dispatch is chain 0; each
+#               auto-dispatched next task is +1. Refused at chain >= max_chain.
+#   fix_round - re-dispatch on the SAME task branch to address a NEEDS-CHANGES review.
+#               0 for a fresh task; refused at fix_round > max_fix_rounds.
+# Inside an automated context the env vars of the ENDING session are authoritative
+# floors (max of all signals), so a caller cannot reset a counter by passing a low value.
 
 param(
     [Parameter(Mandatory)][string]$TaskFile,
-    [int]$Depth = 0,
-    [switch]$SkipClaim
+    [int]$Chain = 0,
+    [int]$FixRound = 0,
+    [string]$FixFindings = '',
+    [switch]$SkipClaim,
+    [int]$Depth = -1   # legacy (pre-ASL-3 callers): treated as a chain floor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,16 +27,39 @@ $prim = Get-PrimaryRoot $PSScriptRoot
 Initialize-LifecycleDirs -Root $prim
 $cfg = Get-LifecycleConfig -Root $prim
 
+$TaskFile = (Resolve-Path $TaskFile).Path   # absolute: the runner re-reads it from another cwd
+
 # ---- Spawn guard (invariant 2), second layer ------------------------------------
-$newDepth = $Depth
-if ($env:LIFECYCLE_SPAWN_DEPTH) {
-    # Called from inside an automated context: the child is one deeper than the caller,
-    # whatever the caller passed.
-    $newDepth = [Math]::Max($Depth, ([int]$env:LIFECYCLE_SPAWN_DEPTH) + 1)
+$maxChain = [int]$cfg.max_chain
+$maxFix   = [int]$cfg.max_fix_rounds
+$isFix    = ($FixRound -gt 0)
+$newChain = [Math]::Max($Chain, $Depth)
+$newFix   = $FixRound
+$envChain = $null
+if ($env:LIFECYCLE_CHAIN) { $envChain = [int]$env:LIFECYCLE_CHAIN }
+elseif ($env:LIFECYCLE_SPAWN_DEPTH) { $envChain = [int]$env:LIFECYCLE_SPAWN_DEPTH }   # pre-ASL-3 session
+if ($null -ne $envChain) {
+    if ($isFix) {
+        $envFix = 0
+        if ($env:LIFECYCLE_FIX_ROUND) { $envFix = [int]$env:LIFECYCLE_FIX_ROUND }
+        $newFix   = [Math]::Max($newFix, $envFix + 1)
+        $newChain = [Math]::Max($newChain, $envChain)
+    } else {
+        $newChain = [Math]::Max($newChain, $envChain + 1)
+    }
 }
-if ($newDepth -ge 2) {
-    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCH_REFUSED' -Detail "depth=$newDepth exceeds limit 1"
-    Write-Error "DISPATCH REFUSED: spawn depth $newDepth would exceed the limit of 1 (invariant 2)."
+if ($newChain -ge $maxChain) {
+    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCH_REFUSED' -Detail "chain=$newChain reaches max_chain=$maxChain"
+    Write-Error "DISPATCH REFUSED: chain position $newChain reaches the cap of $maxChain tasks (invariant 2)."
+    exit 1
+}
+if ($newFix -gt $maxFix) {
+    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCH_REFUSED' -Detail "fix_round=$newFix exceeds max_fix_rounds=$maxFix"
+    Write-Error "DISPATCH REFUSED: fix round $newFix exceeds the cap of $maxFix (invariant 2)."
+    exit 1
+}
+if ($isFix -and -not $SkipClaim) {
+    Write-Error 'A fix round re-uses an already-claimed task; pass -SkipClaim.'
     exit 1
 }
 
@@ -84,11 +114,20 @@ if (-not (Test-Path $wtParent)) { New-Item -ItemType Directory -Force -Path $wtP
 $wt = Join-Path $wtParent $taskId
 $branchName = "task/$taskId"
 
-$r = Invoke-Native -Exe 'git' -Arguments @('-C', $prim, 'worktree', 'add', '-b', $branchName, $wt, $base)
-if ($r.ExitCode -ne 0) {
-    Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'WORKTREE_FAILED' -Detail "$wt (branch $branchName): $($r.Output -join ' / ')"
-    Write-Error "git worktree add failed for $wt (does branch '$branchName' or the path already exist?)"
-    exit 1
+if ($isFix) {
+    # Fix round: same worktree, same branch, carrying the committed audit.
+    if (-not (Test-Path (Join-Path $wt '.lifecycle\active-task.json'))) {
+        Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'FIX_NO_WORKTREE' -Detail $wt
+        Write-Error "Fix round needs the existing worktree $wt, which is missing."
+        exit 1
+    }
+} else {
+    $r = Invoke-Native -Exe 'git' -Arguments @('-C', $prim, 'worktree', 'add', '-b', $branchName, $wt, $base)
+    if ($r.ExitCode -ne 0) {
+        Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'WORKTREE_FAILED' -Detail "$wt (branch $branchName): $($r.Output -join ' / ')"
+        Write-Error "git worktree add failed for $wt (does branch '$branchName' or the path already exist?)"
+        exit 1
+    }
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $wt '.lifecycle\state') | Out-Null
@@ -96,7 +135,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $wt '.lifecycle\state') | O
     task_id       = $taskId
     task_file     = $TaskFile
     title         = $title
-    depth         = $newDepth
+    chain         = $newChain
+    fix_round     = $newFix
     base          = $base
     check_command = $checkCommand
     acceptance    = $acceptance
@@ -107,17 +147,31 @@ New-Item -ItemType Directory -Force -Path (Join-Path $wt '.lifecycle\state') | O
     task_id       = $taskId
     worktree      = $wt
     branch        = $branchName
-    depth         = $newDepth
+    chain         = $newChain
+    fix_round     = $newFix
     dispatched_at = (Get-Date -Format o)
 } | ConvertTo-Json | Set-Content -Path (Join-Path $prim ('.lifecycle\dispatches\{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $taskId)) -Encoding utf8
 
 # ---- Prompt (no double-quote characters: PS 5.1 native-arg quoting mangles them) -----
 # NEVER lead with a slash command: in -p mode an unknown /command aborts the session
 # instantly (Unknown command: /session-start) instead of being read as prompt text.
+$fixBlock = ''
+if ($isFix) {
+    $fixBlock = @"
+
+FIX ROUND $newFix of ${maxFix}: an adversarial review of this branch returned NEEDS-CHANGES.
+Read the audit at $FixFindings (committed on this branch) BEFORE anything else.
+Fix every CRITICAL, HIGH and MEDIUM finding that is correct, with a test that fails without
+the fix where one is practical. For a finding you judge wrong, change no code for it and
+explain why in your final message. Do not widen scope beyond the findings and the task.
+The original task follows for context; its Acceptance criteria still apply.
+"@
+}
 $prompt = @"
-You are running AUTONOMOUSLY (spawn depth $newDepth), dispatched by the session lifecycle.
+You are running AUTONOMOUSLY (chain $newChain, fix round $newFix), dispatched by the session lifecycle.
 If this repo has a session-start skill or command, follow its steps first — but adapt its
 wait-for-user-direction step: the TASK below IS your direction; proceed without waiting.
+$fixBlock
 
 TASK: $title
 
@@ -146,16 +200,18 @@ Rules:
 $promptFile = Join-Path $wt '.lifecycle\dispatch-prompt.txt'
 Set-Content -Path $promptFile -Value $prompt -Encoding utf8
 $sessionLog = Join-Path $wt '.lifecycle\session-output.log'
+if ($isFix) { $sessionLog = Join-Path $wt ".lifecycle\session-output-fix$newFix.log" }
 
 $permArgs = "--permission-mode $($cfg.permission_mode)"
 if ($cfg.permission_mode -eq 'bypassPermissions') {
     $permArgs = '--dangerously-skip-permissions'
 }
 
-$inner = "`$env:LIFECYCLE_SPAWN_DEPTH='$newDepth'; Set-Location '$wt'; Get-Content -Raw '$promptFile' | claude -p $permArgs *> '$sessionLog'"
+$automated = [int](($newChain -gt 0) -or ($newFix -gt 0) -or ($null -ne $envChain))
+$inner = "`$env:LIFECYCLE_CHAIN='$newChain'; `$env:LIFECYCLE_FIX_ROUND='$newFix'; `$env:LIFECYCLE_SPAWN_DEPTH='$automated'; Set-Location '$wt'; Get-Content -Raw '$promptFile' | claude -p $permArgs *> '$sessionLog'"
 Start-Process -FilePath 'powershell' -WindowStyle Hidden -ArgumentList @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner
 )
 
-Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCHED' -Detail "task=$taskId wt=$wt branch=$branchName depth=$newDepth mode=$($cfg.permission_mode)"
-Write-Output "Dispatched '$taskId' (depth $newDepth) in $wt on $branchName (detached claude -p; session output: $sessionLog)"
+Write-LifecycleEvent -Root $prim -Component 'dispatch' -Event 'DISPATCHED' -Detail "task=$taskId wt=$wt branch=$branchName chain=$newChain fix_round=$newFix mode=$($cfg.permission_mode)"
+Write-Output "Dispatched '$taskId' (chain $newChain, fix round $newFix) in $wt on $branchName (detached claude -p; session output: $sessionLog)"
